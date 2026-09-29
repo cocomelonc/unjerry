@@ -10,6 +10,8 @@ decompiler for jerryscript cbc** - see upstream request [jerryscript#5116](https
 
 `unjerry` fills that gap.
 
+> for example, TizenRT + iot.js + JerryScript snapshots are represent current mass-market technology. It currently runs on Samsung washing machines, refrigerators, and air conditioners that lack displays, is integrated with SmartThings, and remains actively supported in 2026.   
+
 ## why
 
 **firmware analysis.** when a device's logic ships as a jerryscript snapshot, today you are stuck reading raw cbc by hand. `unjerry` recovers a readable disassembly / pseudo-source so the logic can be audited.       
