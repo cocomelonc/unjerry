@@ -18,16 +18,18 @@ decompiler for jerryscript cbc** - see upstream request [jerryscript#5116](https
 
 ## status
 
-early. staged milestones:
+working disassembler; decompiler in progress. staged milestones:
 
-1. **[in progress] parse** - snapshot header, literal table, function table.     
-2. **disassemble** - decode cbc opcodes to a readable listing.    
-3. **lift** - reconstruct control flow + expressions.     
-4. **decompile** - emit javascript-like pseudo-source.     
+1. **[done] parse** - snapshot header, function table, recursion into nested functions, annotated hexdump.
+2. **[done] disassemble** - decode cbc opcodes to a readable listing, with correct branch-target and literal-index decoding. (known gap: a few multi-operand opcodes, e.g. `CBC_PUSH_THREE_LITERALS` and some call forms, are not fully operand-decoded yet.)
+3. **[done] multi-version** - snapshot **v70** (jerryscript 3.0.0) and **v63** (shipped by iot.js / tizenrt) both supported; unjerry dispatches on the header version. opcode tables and args-struct layouts differ per version and are generated from each reference source.
+4. **[next] lift + decompile** - resolve literals to names/values, reconstruct control flow, emit javascript-like pseudo-source.
+
+> real-world note: iot.js force-enables snapshot mode and bakes every JS module into firmware as a **v63** snapshot, so v63 is the version that matters for real tizenrt / artik device images.
 
 ## scope / non-goals
 
-- targets a pinned jerryscript version (snapshot format is versioned and *not* stability-guaranteed across releases; see `reference/`). version detection is explicit and the tool refuses formats it does not model.
+- multi-version by design: the snapshot format is versioned and *not* stability-guaranteed across releases, so unjerry carries a per-version spec (opcode table + args layout) and dispatches on the header version; unknown versions fall back to the nearest with a warning.
 - read-only. `unjerry` never executes bytecode.      
 
 ## build

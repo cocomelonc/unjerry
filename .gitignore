@@ -5,6 +5,7 @@
 # reference engine (cloned locally; large). keep it out of the tool repo.
 /reference/jerryscript/
 /reference/build/
+/reference/jerry63
 
 # generated reference corpus binaries (regenerate with `make corpus`)
 /reference/corpus/*.snapshot

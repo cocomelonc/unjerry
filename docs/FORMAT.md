@@ -37,7 +37,7 @@ each function begins with a 6-byte header:
 | 4   | u16  | status_flags  | see below                          |
 
 `status_flags` bits that matter for decoding:
-- `1<<0` FULL_LITERAL_ENCODING - literal-index encoding mode (see §4)
+- `1<<0` FULL_LITERAL_ENCODING - literal-index encoding mode (see 4)
 - `1<<1` UINT16_ARGUMENTS - args struct is the u16 variant
 - `1<<2` STRICT_MODE
 
@@ -118,8 +118,46 @@ add(3, 4)  ->  ...
   CBC_RETURN_FUNCTION_END
 ```
 
+## 5. nested (sub-) functions
+
+`func_offsets[]` in the header lists only the **top-level** functions. nested
+functions are stored as separate compiled-code blobs and referenced from a
+parent's stored literal array. within a function's literal array (register-
+rebased indices), entries in `[const_literal_end - register_end, literal_end -
+register_end)` are **sub-function offsets**. the sub-function's file offset is
+**relative to the enclosing function's base**:
+
+```
+sub_file_offset = parent_file_offset + literal_offset
+```
+
+(an offset of 0 is a self-reference.) recurse to walk the whole function tree.
+
+## 6. version deltas (v63 vs v70)
+
+the format is versioned and layout changes across releases. two matter here:
+**v70** (jerryscript 3.0.0) and **v63** (what iot.js / tizenrt ship — the version
+that shows up in real device firmware).
+
+| thing | v63 | v70 |
+|-------|-----|-----|
+| snapshot version field | 63 | 70 |
+| magic | `0x5952524A` | `0x5952524A` |
+| #opcodes (es5.1 build) | 388 | 410 |
+| some opcode values | `CBC_RETURN`=0x52, `CBC_ADD`=0x95 | `CBC_RETURN`=0x55, `CBC_ADD`=0x98 |
+| u8 args struct | **12 bytes**, no `script_value` | **16 bytes**, has `script_value`@8 |
+| u16 args struct | **20 bytes** | **24 bytes** |
+| u8 field offsets | stack6 arg7 reg8 ident9 clit10 lit11 | stack6 arg7 reg12 ident13 clit14 lit15 |
+| u16 field offsets | stack6 arg8 reg10 ident12 clit14 lit16 | stack6 arg12 reg14 ident16 clit18 lit20 |
+
+the v63 opcode set is **build-config dependent** (opcodes are gated behind
+`#if ENABLED(JERRY_ESNEXT)` etc.), so the table must be generated with the same
+feature flags as the target firmware. the es5.1 profile (ESNEXT off, no realms)
+matches the constrained iot.js builds. unjerry keeps one `vspec` per version.
+
 ## open work
 
-- resolve literal indices to names/values via the snapshot literal table (§1).
-- recurse into nested functions (referenced as literals).
+- resolve literal indices to names/values via the snapshot literal table (1).
+- finish operand decoding for multi-operand opcodes (`*_THREE_LITERALS`, call
+  forms with arg counts) - the 4 arg-flag bits don't capture all of them.
 - lift branches into structured control flow -> decompile to js-like source.

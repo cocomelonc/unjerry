@@ -1,10 +1,14 @@
 /* unjerry - jerryscript snapshot / cbc bytecode disassembler.
  *
- * milestone 1: parse + validate header, walk function table, annotated hexdump,
- * linear cbc disassembly. read-only; never executes bytecode.
+ * parse + validate header, walk the function table (recursing into nested
+ * functions), annotated hexdump, linear cbc disassembly. read-only; never
+ * executes bytecode.
  *
- * format facts (jerryscript v3.0.0, snapshot version 70) are derived from the
- * reference source under reference/jerryscript and pinned here.
+ * multi-version: snapshot v70 (jerryscript 3.0.0) and v63 (the version shipped
+ * by iot.js / tizenrt) have different opcode tables AND args-struct layouts;
+ * unjerry dispatches on the header version (see VSPECS). format facts are
+ * derived from the reference sources under reference/jerryscript (v70) and
+ * reference/jerry63 (v63).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,11 +16,14 @@
 #include <stdint.h>
 #include "reader.h"
 
-/* --- generated, version-accurate opcode tables (cbc_ops[], cbc_ext_ops[]) --- */
-#include "cbc_opcodes.inc"
+/* cbc opcode table row */
+typedef struct { unsigned char op; const char *name; unsigned char flags; signed char stack; } cbc_op_t;
 
-#define JERRY_SNAPSHOT_MAGIC   0x5952524Au   /* "JRRY" */
-#define JERRY_SNAPSHOT_VERSION 70u
+/* --- generated, version-accurate opcode tables (per snapshot version) --- */
+#include "cbc_opcodes_v70.inc"  /* cbc_ops_v70[],  cbc_ext_ops_v70[]  */
+#include "cbc_opcodes_v63.inc"  /* cbc_ops_v63[],  cbc_ext_ops_v63[]  */
+
+#define JERRY_SNAPSHOT_MAGIC 0x5952524Au   /* "JRRY" */
 
 /* snapshot header: 5 x u32 then func_offsets[number_of_funcs] */
 #define SNAPSHOT_HEADER_FIXED  20u
@@ -39,6 +46,37 @@
 
 #define NELEMS(a) (sizeof(a) / sizeof((a)[0]))
 
+/* --- per-version format spec ---------------------------------------------
+ * the snapshot format is versioned: opcode tables AND the cbc args-struct
+ * layout differ between releases. v70 (jerryscript 3.0.0) added a `script_value`
+ * field to the args struct that v63 (the version iot.js/tizenrt ship) lacks, so
+ * offsets and struct sizes differ. unjerry dispatches on the header version. */
+typedef struct { uint32_t stack, arg, reg, ident, clit, lit; } argslayout_t;
+
+typedef struct {
+  uint32_t version;
+  uint32_t u8_size, u16_size;   /* args struct sizes                        */
+  argslayout_t u8, u16;         /* field byte offsets within the function   */
+  const cbc_op_t *ops;  size_t n_ops;
+  const cbc_op_t *ext;  size_t n_ext;
+} vspec_t;
+
+static const vspec_t VSPECS[] = {
+  /* v70: jerryscript 3.0.0. u8 args=16 (has script_value@8), u16 args=24. */
+  { 70, 16, 24,
+    /* u8  */ { .stack = 6, .arg = 7,  .reg = 12, .ident = 13, .clit = 14, .lit = 15 },
+    /* u16 */ { .stack = 6, .arg = 12, .reg = 14, .ident = 16, .clit = 18, .lit = 20 },
+    cbc_ops_v70, NELEMS(cbc_ops_v70), cbc_ext_ops_v70, NELEMS(cbc_ext_ops_v70) },
+  /* v63: shipped by iot.js / tizenrt (es5.1, no realms). u8 args=12, u16=20. */
+  { 63, 12, 20,
+    /* u8  */ { .stack = 6, .arg = 7, .reg = 8,  .ident = 9,  .clit = 10, .lit = 11 },
+    /* u16 */ { .stack = 6, .arg = 8, .reg = 10, .ident = 12, .clit = 14, .lit = 16 },
+    cbc_ops_v63, NELEMS(cbc_ops_v63), cbc_ext_ops_v63, NELEMS(cbc_ext_ops_v63) },
+};
+
+/* active spec, chosen from the header version (see main) */
+static const vspec_t *V = &VSPECS[0];
+
 typedef struct {
   uint32_t off;            /* file offset of this compiled_code            */
   uint32_t byte_size;      /* size field << 3                              */
@@ -49,16 +87,22 @@ typedef struct {
   uint32_t args_size;      /* 16 or 24                                     */
   uint32_t bytecode_start; /* file offset where cbc begins                 */
   int      is_eval_ctx;    /* low bit of func_offset                       */
+  /* stored literal array (register-rebased, per snapshot_load_compiled_code) */
+  uint32_t lit_array_off;  /* file offset of the stored literal array      */
+  uint32_t n_stored_lits;  /* literal_end - register_end                   */
+  uint32_t const_lits_reb; /* const_literal_end - register_end             */
 } func_t;
 
+#define MAX_DEPTH 32
+
 static const char *op_name(unsigned op, int ext) {
-  const cbc_op_t *t = ext ? cbc_ext_ops : cbc_ops;
-  size_t n = ext ? NELEMS(cbc_ext_ops) : NELEMS(cbc_ops);
+  const cbc_op_t *t = ext ? V->ext : V->ops;
+  size_t n = ext ? V->n_ext : V->n_ops;
   return (op < n) ? t[op].name : "<unknown>";
 }
 static unsigned op_flags(unsigned op, int ext) {
-  const cbc_op_t *t = ext ? cbc_ext_ops : cbc_ops;
-  size_t n = ext ? NELEMS(cbc_ext_ops) : NELEMS(cbc_ops);
+  const cbc_op_t *t = ext ? V->ext : V->ops;
+  size_t n = ext ? V->n_ext : V->n_ops;
   return (op < n) ? t[op].flags : 0;
 }
 
@@ -87,52 +131,68 @@ static int parse_func(reader_t *r, uint32_t raw_off, func_t *f) {
   f->uint16_args = (f->status_flags & CBC_FLAGS_UINT16_ARGUMENTS) ? 1 : 0;
 
   if (f->uint16_args) {
-    f->args_size          = 24;
-    f->stack_limit        = rd_u16_at(r, off + 6);
-    f->argument_end       = rd_u16_at(r, off + 12);
-    f->register_end       = rd_u16_at(r, off + 14);
-    f->ident_end          = rd_u16_at(r, off + 16);
-    f->const_literal_end  = rd_u16_at(r, off + 18);
-    f->literal_end        = rd_u16_at(r, off + 20);
+    const argslayout_t *L = &V->u16;
+    f->args_size          = V->u16_size;
+    f->stack_limit        = rd_u16_at(r, off + L->stack);
+    f->argument_end       = rd_u16_at(r, off + L->arg);
+    f->register_end       = rd_u16_at(r, off + L->reg);
+    f->ident_end          = rd_u16_at(r, off + L->ident);
+    f->const_literal_end  = rd_u16_at(r, off + L->clit);
+    f->literal_end        = rd_u16_at(r, off + L->lit);
   } else {
-    f->args_size          = 16;
-    f->stack_limit        = rd_u8_at(r, off + 6);
-    f->argument_end       = rd_u8_at(r, off + 7);
-    f->register_end       = rd_u8_at(r, off + 12);
-    f->ident_end          = rd_u8_at(r, off + 13);
-    f->const_literal_end  = rd_u8_at(r, off + 14);
-    f->literal_end        = rd_u8_at(r, off + 15);
+    const argslayout_t *L = &V->u8;
+    f->args_size          = V->u8_size;
+    f->stack_limit        = rd_u8_at(r, off + L->stack);
+    f->argument_end       = rd_u8_at(r, off + L->arg);
+    f->register_end       = rd_u8_at(r, off + L->reg);
+    f->ident_end          = rd_u8_at(r, off + L->ident);
+    f->const_literal_end  = rd_u8_at(r, off + L->clit);
+    f->literal_end        = rd_u8_at(r, off + L->lit);
   }
   if (r->err) return -1;
 
-  /* byte_code_start = args_end + (literal_end - register_end) * sizeof(ecma_value_t) */
+  /* the stored literal array follows the args struct; indices are rebased by
+   * register_end (see snapshot_load_compiled_code). value literals occupy
+   * [0, const_lits_reb), sub-function literals [const_lits_reb, n_stored_lits). */
   int32_t stored_lits = (int32_t) f->literal_end - (int32_t) f->register_end;
   if (stored_lits < 0) stored_lits = 0; /* defensive: malformed */
-  f->bytecode_start = off + f->args_size + (uint32_t) stored_lits * ECMA_VALUE_SIZE;
+  int32_t const_reb = (int32_t) f->const_literal_end - (int32_t) f->register_end;
+  if (const_reb < 0) const_reb = 0;
+  f->n_stored_lits = (uint32_t) stored_lits;
+  f->const_lits_reb = (uint32_t) const_reb;
+  f->lit_array_off = off + f->args_size;
+  /* byte_code_start = args_end + n_stored_lits * sizeof(ecma_value_t) */
+  f->bytecode_start = f->lit_array_off + f->n_stored_lits * ECMA_VALUE_SIZE;
   return 0;
 }
 
-static void print_func_header(const func_t *f, int i) {
-  printf("\n; function[%d] @0x%x  ctx=%s  size=%u bytes\n",
-         i, f->off, f->is_eval_ctx ? "eval" : "global/func", f->byte_size);
-  printf(";   status_flags=0x%04x [%s%s%s]\n", f->status_flags,
+static void indent(int depth) { for (int k = 0; k < depth; k++) printf("  "); }
+
+static void print_func_header(const func_t *f, const char *label, int depth) {
+  printf("\n");
+  indent(depth);
+  printf("; %s @0x%x  ctx=%s  size=%u bytes  subfuncs=%u\n",
+         label, f->off, f->is_eval_ctx ? "eval" : "global/func", f->byte_size,
+         f->n_stored_lits > f->const_lits_reb ? f->n_stored_lits - f->const_lits_reb : 0);
+  indent(depth);
+  printf(";   status=0x%04x [%s%s%s]  args=%u regs=%u lits=%u(const=%u) stack=%u  bytecode @0x%x\n",
+         f->status_flags,
          (f->status_flags & CBC_FLAGS_UINT16_ARGUMENTS) ? "u16args " : "u8args ",
          (f->status_flags & CBC_FLAGS_FULL_LITERAL_ENCODING) ? "full-lit-enc " : "small-lit-enc ",
-         (f->status_flags & CBC_FLAGS_STRICT_MODE) ? "strict" : "");
-  printf(";   args=%u regs=%u ident_end=%u const_lit_end=%u literal_end=%u stack=%u\n",
-         f->argument_end, f->register_end, f->ident_end,
-         f->const_literal_end, f->literal_end, f->stack_limit);
-  printf(";   bytecode @0x%x\n", f->bytecode_start);
+         (f->status_flags & CBC_FLAGS_STRICT_MODE) ? "strict" : "",
+         f->argument_end, f->register_end, f->literal_end, f->const_literal_end,
+         f->stack_limit, f->bytecode_start);
 }
 
 /* linear disassembly of one function's cbc region */
-static void disasm_func(reader_t *r, const func_t *f) {
+static void disasm_func(reader_t *r, const func_t *f, int depth) {
   int full = (f->status_flags & CBC_FLAGS_FULL_LITERAL_ENCODING) ? 1 : 0;
   uint32_t end = f->off + f->byte_size; /* upper bound of this compiled_code */
   if (end > r->len) end = (uint32_t) r->len;
 
   reader_t d = *r;
   d.pos = f->bytecode_start;
+  uint32_t max_target = 0; /* farthest forward-branch target seen so far */
 
   while (d.pos < end && !d.err) {
     uint32_t ip = (uint32_t) d.pos;
@@ -143,6 +203,7 @@ static void disasm_func(reader_t *r, const func_t *f) {
     if (d.err) break;
 
     unsigned flags = op_flags(op, ext);
+    indent(depth);
     printf("  0x%04x: %-28s", ip, op_name(op, ext));
 
     if (flags & CBC_HAS_LITERAL_ARG)
@@ -164,18 +225,57 @@ static void disasm_func(reader_t *r, const func_t *f) {
       for (unsigned k = 0; k < blen && !d.err; k++) offv = (offv << 8) | rd_u8(&d);
       int fwd = (flags & CBC_FORWARD_BRANCH) ? 1 : 0;
       long tgt = fwd ? (long) ip + (long) offv : (long) ip - (long) offv;
+      if (fwd && tgt > (long) max_target) max_target = (uint32_t) tgt;
       printf(" -> 0x%04lx (%s %u)", tgt, fwd ? "fwd" : "back", offv);
     }
     printf("\n");
 
-    /* stop cleanly at function terminators to avoid running into literal pools */
+    /* stop at a block terminator, but only once we are past every forward
+     * branch target seen (otherwise code after an if/else is still live).
+     * this keeps us from disassembling the trailing literal / line-info pool. */
     const char *nm = op_name(op, ext);
-    if (!ext && (strcmp(nm, "CBC_RETURN") == 0
-                 || strcmp(nm, "CBC_RETURN_WITH_BLOCK") == 0
-                 || strcmp(nm, "CBC_RETURN_FUNCTION_END") == 0))
-      break;
+    int is_term = (!ext && (strstr(nm, "RETURN") || strstr(nm, "THROW")
+                            || strncmp(nm, "CBC_JUMP", 8) == 0));
+    if (is_term && (uint32_t) d.pos > max_target) break;
   }
-  if (d.err) printf("  ; <disasm stopped: reached buffer/section bound>\n");
+  if (d.err) { indent(depth); printf("  ; <disasm stopped: reached buffer/section bound>\n"); }
+}
+
+/* recursively parse + print a function and its nested sub-functions.
+ * sub-function file offset = parent_off + literal_offset (relative to the
+ * enclosing function's base, per snapshot_load_compiled_code). */
+static void walk_func(reader_t *r, uint32_t raw_off, const char *label,
+                      int depth, int do_disasm) {
+  func_t f;
+  if (parse_func(r, raw_off, &f) != 0) {
+    indent(depth);
+    printf("; %s @0x%x - parse error (truncated)\n", label, raw_off & ~1u);
+    return;
+  }
+  print_func_header(&f, label, depth);
+  if (do_disasm) disasm_func(r, &f, depth);
+
+  if (depth >= MAX_DEPTH) {
+    indent(depth); printf(";   <max nesting depth reached>\n");
+    return;
+  }
+
+  /* sub-function literals live at rebased indices [const_lits_reb, n_stored_lits) */
+  uint32_t sub_idx = 0;
+  for (uint32_t j = f.const_lits_reb; j < f.n_stored_lits; j++) {
+    uint32_t lit_off = rd_u32_at(r, f.lit_array_off + j * ECMA_VALUE_SIZE);
+    if (r->err) break;
+    if (lit_off == 0) continue;               /* self-reference; skip */
+    uint32_t sub = f.off + lit_off;           /* relative to enclosing base */
+    if (sub <= f.off || sub >= r->len) {       /* defensive against malformed */
+      indent(depth + 1);
+      printf("; <bad sub-function offset 0x%x at lit %u>\n", sub, j);
+      continue;
+    }
+    char sublabel[64];
+    snprintf(sublabel, sizeof(sublabel), "%s.sub[%u]", label, sub_idx++);
+    walk_func(r, sub, sublabel, depth + 1, do_disasm);
+  }
 }
 
 static void hexdump(const uint8_t *p, size_t len, size_t max) {
@@ -245,11 +345,20 @@ int main(int argc, char **argv) {
     free(buf); return 1;
   }
 
+  /* pick the format spec matching the snapshot version */
+  const vspec_t *sel = NULL;
+  for (size_t i = 0; i < NELEMS(VSPECS); i++)
+    if (VSPECS[i].version == version) { sel = &VSPECS[i]; break; }
+  if (sel) V = sel;
+
   printf("== unjerry: %s (%zu bytes) ==\n", path, len);
   printf("magic          : 0x%08x %s\n", magic,
          magic == JERRY_SNAPSHOT_MAGIC ? "(JRRY ok)" : "(BAD - not a jerryscript snapshot)");
-  printf("version        : %u %s\n", version,
-         version == JERRY_SNAPSHOT_VERSION ? "(ok)" : "(unsupported - parse may be wrong)");
+  if (sel)
+    printf("version        : %u (supported)\n", version);
+  else
+    printf("version        : %u (UNSUPPORTED - falling back to v%u layout; parse may be wrong)\n",
+           version, V->version);
   printf("global_flags   : 0x%08x\n", gflags);
   printf("lit_table_off  : 0x%x (%u)\n", lit_off, lit_off);
   printf("number_of_funcs: %u\n", nfuncs);
@@ -268,15 +377,12 @@ int main(int argc, char **argv) {
     free(buf); return 0;
   }
 
+  int do_disasm = (strcmp(mode, "-d") == 0);
   for (uint32_t i = 0; i < nfuncs; i++) {
     uint32_t raw_off = rd_u32_at(&r, SNAPSHOT_HEADER_FIXED + i * 4);
-    func_t f;
-    if (parse_func(&r, raw_off, &f) != 0) {
-      printf("\n; function[%u] @0x%x - parse error (truncated)\n", i, raw_off & ~1u);
-      continue;
-    }
-    print_func_header(&f, (int) i);
-    if (strcmp(mode, "-d") == 0) disasm_func(&r, &f);
+    char label[32];
+    snprintf(label, sizeof(label), "function[%u]", i);
+    walk_func(&r, raw_off, label, 0, do_disasm);
   }
 
   free(buf);
