@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gen-opcodes.sh — regenerate a version-accurate CBC opcode table from a
+# gen-opcodes.sh - regenerate a version-accurate CBC opcode table from a
 # jerryscript source tree, using jerryscript's own X-macro opcode list.
 #
 # usage: gen-opcodes.sh <jerry_src_dir> <suffix> <out_inc>

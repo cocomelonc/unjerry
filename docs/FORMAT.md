@@ -136,7 +136,7 @@ sub_file_offset = parent_file_offset + literal_offset
 ## 6. version deltas (v63 vs v70)
 
 the format is versioned and layout changes across releases. two matter here:
-**v70** (jerryscript 3.0.0) and **v63** (what iot.js / tizenrt ship — the version
+**v70** (jerryscript 3.0.0) and **v63** (what iot.js / tizenrt ship - the version
 that shows up in real device firmware).
 
 | thing | v63 | v70 |
